@@ -19,10 +19,10 @@
     <MERGE3  min_interval="10000"
              max_interval="30000"/>
     <FD_SOCK/>
-    <FD_ALL timeout="30000" />
+    <FD_ALL timeout="9000" interval="3000" />
     <VERIFY_SUSPECT timeout="1500"  />
     <BARRIER />
-    <pbcast.NAKACK2 use_mcast_xmit="false"/>
+    <pbcast.NAKACK2 use_mcast_xmit="false" />
     <UNICAST3 />
     <pbcast.STABLE desired_avg_gossip="50000"
                    max_bytes="4M"/>
