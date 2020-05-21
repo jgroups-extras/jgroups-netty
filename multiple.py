@@ -14,7 +14,8 @@ for i in range(int(instances)):
     process = subprocess.Popen(["java", "-classpath", "./target/jgroups-netty-1.0-SNAPSHOT.jar:target/dependency/*",
                                 "org.jgroups.tests.perf.UPerf", "-props", props, "-nohup"])
     all_pid.append(process)
-time.sleep(int(delay))
+    time.sleep(int(delay))
+
 try:
     t = input("any Button to exit")
 finally:
