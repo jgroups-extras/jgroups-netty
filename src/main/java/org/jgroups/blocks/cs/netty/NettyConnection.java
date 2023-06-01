@@ -1,33 +1,6 @@
 package org.jgroups.blocks.cs.netty;
 
-import io.netty.bootstrap.Bootstrap;
-import io.netty.bootstrap.ServerBootstrap;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.channel.*;
-import io.netty.channel.epoll.EpollEventLoopGroup;
-import io.netty.channel.epoll.EpollServerSocketChannel;
-import io.netty.channel.epoll.EpollSocketChannel;
-import io.netty.channel.kqueue.KQueueEventLoopGroup;
-import io.netty.channel.kqueue.KQueueServerSocketChannel;
-import io.netty.channel.kqueue.KQueueSocketChannel;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.channel.unix.Errors;
-import io.netty.incubator.channel.uring.IOUringEventLoopGroup;
-import io.netty.incubator.channel.uring.IOUringServerSocketChannel;
-import io.netty.incubator.channel.uring.IOUringSocketChannel;
-import io.netty.util.concurrent.DefaultEventExecutorGroup;
-import io.netty.util.concurrent.EventExecutorGroup;
-import netty.listeners.ChannelLifecycleListener;
-import netty.listeners.NettyReceiverListener;
-import netty.utils.PipelineChannelInitializer;
-import org.jgroups.Address;
-import org.jgroups.logging.Log;
-import org.jgroups.stack.IpAddress;
-import org.jgroups.util.Util;
+import static org.jgroups.protocols.TP.MULTICAST;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -35,63 +8,120 @@ import java.io.IOException;
 import java.net.BindException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+
+import org.jgroups.Address;
+import org.jgroups.ByteBufMessage;
+import org.jgroups.PhysicalAddress;
+import org.jgroups.Version;
+import org.jgroups.logging.Log;
+import org.jgroups.protocols.TP;
+import org.jgroups.stack.IpAddress;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.ByteBufOutputStream;
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ServerChannel;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.unix.Errors;
+import io.netty.util.AttributeKey;
+import netty.listeners.ChannelLifecycleListener;
+import netty.listeners.NettyReceiverListener;
+import netty.utils.PipelineChannelInitializer;
 
 /***
  * @author Baizel Mathew
  */
 public class NettyConnection {
-
-    private final EventExecutorGroup separateWorkerGroup = new DefaultEventExecutorGroup(4);
-    private final Bootstrap outgoingBootstrap = new Bootstrap();
-    private final ServerBootstrap inboundBootstrap = new ServerBootstrap();
-    private final Map<IpAddress, Channel> ipAddressChannelMap = new HashMap<>();
-    private byte[] replyAdder = null;
+    private final Bootstrap clientBootstrap = new Bootstrap();
+    private final ServerBootstrap serverBootstrap = new ServerBootstrap();
+    private final Map<PhysicalAddress, Channel> clientChannelMap = new ConcurrentHashMap<>();
+    private final Map<IpAddress, ChannelFuture> clientFuturesMap = new ConcurrentHashMap<>();
+    private final Map<PhysicalAddress, Channel> serverChannelMap = new ConcurrentHashMap<>();
     private final int port;
     private final InetAddress bind_addr;
     private final EventLoopGroup boss_group; // Only handles incoming connections
     private final EventLoopGroup worker_group;
-    private boolean useNativeTransport;
-    private boolean useIOURing;
     private final NettyReceiverListener callback;
-    private final ChannelLifecycleListener lifecycleListener;
+    private final ChannelLifecycleListener clientLifecycleListener;
+    private final ChannelLifecycleListener serverLifecycleListener;
+    private final Class<? extends ServerChannel> serverChannel;
+    private final Class<? extends SocketChannel> clientChannel;
     private final Log log;
-
-
-    public boolean useNativeTransport() {return useNativeTransport;}
-    public boolean useIOURing()         {return useIOURing;}
-
+    public byte[] replyAdder = null;
 
 
     public NettyConnection(InetAddress bind_addr, int port, NettyReceiverListener callback, Log log,
-                           boolean useNativeTransport, boolean useIOURing) {
+                           EventLoopGroup bossGroup, EventLoopGroup workerGroup, Class<? extends ServerChannel> serverChannel,
+                           Class<? extends SocketChannel> clientChannel) {
         this.port = port;
         this.bind_addr = bind_addr;
         this.callback = callback;
         this.log=log;
-        this.useNativeTransport=useNativeTransport;
-        this.useIOURing = useIOURing;
-        boss_group = createEventLoopGroup(1);
-        worker_group = createEventLoopGroup(0);
+        this.boss_group = bossGroup;
+        this.worker_group = workerGroup;
+        this.serverChannel = Objects.requireNonNull(serverChannel);
+        this.clientChannel = Objects.requireNonNull(clientChannel);
 
-        lifecycleListener = new ChannelLifecycleListener() {
+        clientLifecycleListener = new ChannelLifecycleListener() {
             @Override
             public void channelInactive(Channel channel) {
-                ipAddressChannelMap.values().remove(channel);
+                IpAddress ipAddress = channel.attr(ADDRESS_ATTRIBUTE).get();
+                if (ipAddress != null) {
+                    clientChannelMap.remove(ipAddress);
+                } else {
+                    clientChannelMap.values().remove(channel);
+                }
             }
 
             @Override
             public void channelRead(Channel channel, IpAddress sender) {
-                updateMap(channel, sender);
+                updateMap(channel, sender, false);
+            }
+
+            @Override
+            public void channelActive(ChannelHandlerContext ctx) { }
+        };
+
+        serverLifecycleListener = new ChannelLifecycleListener() {
+            @Override
+            public void channelInactive(Channel channel) {
+                IpAddress ipAddress = channel.attr(ADDRESS_ATTRIBUTE).get();
+                if (ipAddress != null) {
+                    serverChannelMap.remove(ipAddress);
+                } else {
+                    serverChannelMap.values().remove(channel);
+                }
+            }
+
+            @Override
+            public void channelRead(Channel channel, IpAddress sender) {
+                updateMap(channel, sender, true);
+            }
+
+            @Override
+            public void channelActive(ChannelHandlerContext ctx) {
+                ctx.channel().attr(ADDRESS_WRITE_STATUS).set(Boolean.TRUE);
             }
         };
-        configureClient();
         configureServer();
+        configureClient();
     }
 
     public void run() throws InterruptedException, BindException, Errors.NativeIoException {
-        inboundBootstrap.bind().sync();
+        serverBootstrap.bind().sync();
 
         try {
             ByteArrayOutputStream replyAddByteStream = new ByteArrayOutputStream();
@@ -104,136 +134,173 @@ public class NettyConnection {
         }
     }
 
-    public final void send(IpAddress destAddr, byte[] data, int offset, int length) {
-        Channel opened = ipAddressChannelMap.getOrDefault(destAddr, null);
-        if (opened != null)
-            writeToChannel(opened, data, offset, length);
+    public final void send(IpAddress destAddr, boolean oob, ByteBufMessage msg) {
+        Channel opened = null;
+        if (oob) {
+            // OOB messages use the client socket until the server finally gets its connected client
+            // By using the server channel for OOB it won't mess with the back pressure of normal messages as they
+            // tend to be much higher weight since it can only run sequentially.
+            opened = serverChannelMap.get(destAddr);
+        }
+        if (opened == null) {
+            opened = clientChannelMap.get(destAddr);
+        }
+        if (opened != null) {
+            if (opened.eventLoop().inEventLoop()) {
+                packAndFlushToChannel(opened, msg);
+            } else {
+                Channel finalChannel = opened;
+                opened.eventLoop().submit(() -> packAndFlushToChannel(finalChannel, msg));
+            }
+        }
         else
-            connectAndSend(destAddr, data, offset, length);
+            connectAndSend(destAddr, msg);
     }
 
-    public final void connectAndSend(IpAddress addr, byte[] data, int offset, int length) {
-        ChannelFuture cf = outgoingBootstrap.connect(new InetSocketAddress(addr.getIpAddress(), addr.getPort()));
-        // Putting pack(...) inside the lambda causes unexpected behaviour.
-        // Both send and receive works fine but it does not get passed up properly, might be something to do with the buffer
-        ByteBuf packed = pack(cf.channel().alloc(), data, offset, length, replyAdder);
+    public static AttributeKey<IpAddress> ADDRESS_ATTRIBUTE = AttributeKey.newInstance("jgroups-ipaddress");
+    // Unfortunately it is possible for write status to send two writeable messages in a row, this attribute
+    // store the last status update we sent and will prevent us from sending duplicate statuses
+    public static AttributeKey<Boolean> ADDRESS_WRITE_STATUS = AttributeKey.newInstance("jgroups-write-status");
+
+    public final void connectAndSend(IpAddress addr, ByteBufMessage msg) {
+        connectAndSend(addr, ch -> packAndFlushToChannel(ch, msg));
+    }
+
+    private void connectAndSend(IpAddress addr, Consumer<Channel> consumer) {
+        ChannelFuture cf = openNewClientChannel(addr);
         cf.addListener((ChannelFutureListener) channelFuture -> {
             if (channelFuture.isSuccess()) {
                 Channel ch = channelFuture.channel();
-                writeToChannel(ch, packed);
-                updateMap(ch, addr);
+                ch.attr(ADDRESS_ATTRIBUTE).set(addr);
+                ch.attr(ADDRESS_WRITE_STATUS).set(Boolean.TRUE);
+                consumer.accept(ch);
+                updateMap(ch, addr, false);
+            } else {
+                log.trace("Unable to connect to " + addr, channelFuture.cause());
             }
+            clientFuturesMap.remove(addr);
+        });
+    }
+    ChannelFuture openNewClientChannel(IpAddress address) {
+        return clientFuturesMap.computeIfAbsent(address, addr -> {
+            // Just in case we have a concurrent ChannelFuture complete, note it MUST remove from this map after
+            // adding to the map
+            Channel addedChannel = clientChannelMap.get(addr);
+            if (addedChannel != null) {
+                return addedChannel.newSucceededFuture();
+            }
+            return clientBootstrap.connect(new InetSocketAddress(addr.getIpAddress(), addr.getPort()));
         });
     }
 
-    public final void connectAndSend(IpAddress addr) {
-        //Send an empty message so receiver knows reply addr. otherwise Receiver will make another connection
-        connectAndSend(addr, null, 0, 0);
+    public Channel getServerChannelForAddress(Address address, boolean server) {
+        return (server ? serverChannelMap : clientChannelMap).get(address);
     }
 
-    public Address getLocalAddress() {
-        return new IpAddress(bind_addr, port);
+    private void packAndFlushToChannel(Channel ch, ByteBufMessage msg) {
+        int bufferSize = (Integer.BYTES * 2) + replyAdder.length + TP.MSG_OVERHEAD + msg.nonPayloadSize();
+        ByteBuf first = ch.alloc().buffer(bufferSize, bufferSize);
+        ByteBuf payload = msg.getBuf();
+        first.writeInt(bufferSize - Integer.BYTES + payload.readableBytes());
+        first.writeBytes(replyAdder);
+
+        try (ByteBufOutputStream bbos = new ByteBufOutputStream(first)) {
+
+            byte flags = 0;
+            bbos.writeShort(Version.version); // write the version
+            if (msg.getDest() == null)
+                flags += MULTICAST;
+            bbos.writeByte(flags);
+            bbos.writeShort(msg.getType());
+
+            msg.writeNonPayload(bbos);
+            // TODO: this is written to tell the bytes how big the buffer is
+            bbos.writeInt(payload.readableBytes());
+
+            assert first.writerIndex() == first.capacity();
+            // We send as two ByteBuf so we don't want to modify the original
+            ch.write(first, ch.voidPromise());
+            writeAndFlushToChannel(ch, payload);
+        } catch (IOException e) {
+            // Shouldn't be possible
+            throw new RuntimeException(e);
+        }
     }
 
-    public void shutdown() throws InterruptedException {
-        boss_group.shutdownGracefully();
-        worker_group.shutdownGracefully();
-        separateWorkerGroup.shutdownGracefully();
+    public final void send(IpAddress destAddr, boolean oob, ByteBuf buf) {
+        Channel opened = null;
+        if (oob) {
+            // OOB messages use the client socket until the server finally gets its connected client
+            // By using the server channel for OOB it won't mess with the back pressure of normal messages as they
+            // tend to be much higher weight since it can only run sequentially.
+            opened = serverChannelMap.get(destAddr);
+        }
+        if (opened == null) {
+            opened = clientChannelMap.get(destAddr);
+        }
+        if (opened != null) {
+            if (opened.eventLoop().inEventLoop()) {
+                writeAndFlushToChannel(opened, buf);
+            } else {
+                Channel finalChannel = opened;
+                opened.eventLoop().submit(() -> writeAndFlushToChannel(finalChannel, buf));
+            }
+        }
+        else
+            connectAndSend(destAddr, ch -> writeAndFlushToChannel(ch, buf));
     }
 
-    private void writeToChannel(Channel ch, byte[] data, int offset, int length) {
-        ByteBuf packed = pack(ch.alloc(), data, offset, length, replyAdder);
-        writeToChannel(ch, packed);
+    private static void writeAndFlushToChannel(Channel ch, ByteBuf data) {
+        ch.writeAndFlush(data, ch.voidPromise());
     }
 
-    private static void writeToChannel(Channel ch, ByteBuf data) {
-        ch.eventLoop().execute(() -> ch.writeAndFlush(data, ch.voidPromise()));
-    }
-
-    private void updateMap(Channel connected, IpAddress destAddr) {
-        Channel channel = ipAddressChannelMap.get(destAddr);
-        if (channel != null && channel.id() == connected.id())
-            return;
-
+    private void updateMap(Channel connected, IpAddress destAddr, boolean server) {
+        Map<PhysicalAddress, Channel> map = server ? serverChannelMap : clientChannelMap;
+        Channel channel = map.get(destAddr);
         if (channel != null) {
-            //if we already have a connection and then this will only be true in one of the nodes thus only closing one connection instead of two
-            if (connected.remoteAddress().equals(new InetSocketAddress(destAddr.getIpAddress(), destAddr.getPort()))) {
-                connected.close();
+            if (channel == connected) {
+                return;
             }
-            return;
         }
-        ipAddressChannelMap.put(destAddr, connected);
+        channel = map.putIfAbsent(destAddr, connected);
+        if (channel != null) {
+            throw new IllegalStateException("Address " + destAddr + " already registered as server: " + server + ", second attempt received!");
+        }
+        log.debug("%s:%s Destination is server: %s with address %s bound to %s", bind_addr, port, server, destAddr, Thread.currentThread());
+        connected.attr(ADDRESS_ATTRIBUTE).set(destAddr);
     }
-
-    protected EventLoopGroup createEventLoopGroup(int numThreads) {
-        if(useIOURing) {
-            try {
-                return numThreads > 0? new IOUringEventLoopGroup(numThreads) : new IOUringEventLoopGroup();
-            }
-            catch(Throwable t) {
-                log.warn("failed to use io_uring (disabling it): " + t.getMessage());
-                useIOURing=false;
-            }
-        }
-        if(useNativeTransport) {
-            try {
-                if(Util.checkForMac())
-                    return numThreads > 0? new KQueueEventLoopGroup(numThreads) : new KQueueEventLoopGroup();
-                return numThreads > 0? new EpollEventLoopGroup(numThreads) : new EpollEventLoopGroup(); // Linux
-            }
-            catch(Throwable t) {
-                log.warn("failed to use native transport", t);
-                useNativeTransport=false;
-            }
-        }
-        log.debug("falling back to " + NioEventLoopGroup.class.getSimpleName());
-        return numThreads > 0? new NioEventLoopGroup(numThreads) : new NioEventLoopGroup();
-    }
-
-    protected Class<? extends Channel> channelClass(boolean server) {
-        if(useIOURing)
-            return server? IOUringServerSocketChannel.class : IOUringSocketChannel.class;
-        if(useNativeTransport) {
-            if(Util.checkForMac())
-                return server? KQueueServerSocketChannel.class : KQueueSocketChannel.class;
-            return server? EpollServerSocketChannel.class : EpollSocketChannel.class;
-        }
-        return server? NioServerSocketChannel.class : NioSocketChannel.class;
-    }
-
-
 
     private void configureClient() {
-        outgoingBootstrap.group(worker_group)
-          .handler(new PipelineChannelInitializer(this.callback, lifecycleListener, separateWorkerGroup))
+        clientBootstrap.group(worker_group)
+          .handler(new PipelineChannelInitializer(this.callback, clientLifecycleListener))
+          .channel(clientChannel)
           .localAddress(bind_addr, 0)
           .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 1000)
           .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .option(ChannelOption.TCP_NODELAY, true);
-        outgoingBootstrap.channel(channelClass(false));
     }
 
     private void configureServer() {
-        inboundBootstrap.group(boss_group, worker_group)
+        serverBootstrap.group(boss_group, worker_group)
                 .localAddress(bind_addr, port)
-                .childHandler(new PipelineChannelInitializer(this.callback, lifecycleListener, separateWorkerGroup))
+                .channel(serverChannel)
+                .childHandler(new PipelineChannelInitializer(this.callback, serverLifecycleListener))
                 .option(ChannelOption.SO_REUSEADDR, true)
                 .option(ChannelOption.SO_BACKLOG, 128)
                 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
           .childOption(ChannelOption.TCP_NODELAY, true);
-        Class<? extends Channel> ch=channelClass(true);
-        inboundBootstrap.channel((Class<? extends ServerChannel>)ch);
     }
 
     private static ByteBuf pack(ByteBufAllocator allocator, byte[] data, int offset, int length, byte[] replyAdder) {
-        int allocSize = Integer.BYTES + length + Integer.BYTES + replyAdder.length;
-        ByteBuf buf = allocator.buffer(allocSize);
+        // TODO: we can optimize away the replyAddr later
+        int allocSize = Integer.BYTES + length + replyAdder.length;
+        ByteBuf buf = allocator.buffer(allocSize, allocSize);
         // size of data + size replyAddr.length field  + space for reply addr bytes = total frame size
-        buf.writeInt(length + replyAdder.length + Integer.BYTES);  //encode frame size and data length
-        buf.writeInt(replyAdder.length);
+        buf.writeInt(length + replyAdder.length);  //encode frame size and data length
         buf.writeBytes(replyAdder);
         if (data != null)
             buf.writeBytes(data, offset, length);
+        assert buf.writerIndex() == buf.capacity();
         return buf;
     }
 }

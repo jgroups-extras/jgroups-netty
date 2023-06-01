@@ -33,8 +33,8 @@
     <properties>
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
-        <version.jgroups>5.2.11.Final</version.jgroups>
-        <version.netty>4.1.86.Final</version.netty>
+        <version.jgroups>5.2.15.Final-SNAPSHOT</version.jgroups>
+        <version.netty>4.1.91.Final</version.netty>
         <nexus.server.id>jboss-releases-repository</nexus.server.id>
         <nexus.server.url>https://repository.jboss.org/nexus</nexus.server.url>
         <nexus.snapshot.server.id>jboss-snapshots-repository</nexus.snapshot.server.id>

@@ -1,49 +1,51 @@
 package netty.utils;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.channel.ChannelHandler;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import netty.listeners.ChannelLifecycleListener;
-import netty.listeners.NettyReceiverListener;
+import java.io.DataInput;
+import java.io.InputStream;
+
+import org.jgroups.blocks.cs.netty.NettyConnection;
 import org.jgroups.stack.IpAddress;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.util.Attribute;
+import netty.listeners.ChannelLifecycleListener;
+import netty.listeners.NettyReceiverListener;
 
 /***
  * @author Baizel Mathew
  */
-@ChannelHandler.Sharable
 public class ReceiverHandler extends ChannelInboundHandlerAdapter {
-    private NettyReceiverListener nettyReceiverListener;
-    private ChannelLifecycleListener lifecycleListener;
-    private byte[] buffer = new byte[65200];
+    private final NettyReceiverListener nettyReceiverListener;
+    private final ChannelLifecycleListener lifecycleListener;
 
     public ReceiverHandler(NettyReceiverListener nettyReceiverListener, ChannelLifecycleListener lifecycleListener) {
-        super();
         this.nettyReceiverListener = nettyReceiverListener;
         this.lifecycleListener = lifecycleListener;
     }
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        ByteBuf msgbuf = (ByteBuf) msg;
-        int totalLength = msgbuf.readInt();
-        int addrLen = msgbuf.readInt();
-        int dataLen = totalLength - Integer.BYTES - addrLen;
-
-        msgbuf.readBytes(buffer, 0, addrLen);
-        msgbuf.readBytes(buffer, addrLen, dataLen);
+        DataInput input = (DataInput) msg;
 
         IpAddress sender = new IpAddress();
-        sender.readFrom(new DataInputStream(new ByteArrayInputStream(buffer, 0, addrLen)));
-        synchronized (this) {
-            nettyReceiverListener.onReceive(sender, buffer, addrLen, dataLen);
-        }
-        msgbuf.release();
+        sender.readFrom(input);
+
         lifecycleListener.channelRead(ctx.channel(), sender);
 
+        try {
+            nettyReceiverListener.onReceive(sender, input);
+        } catch (Throwable t) {
+            // If there was an error, consume the rest of input
+            input.skipBytes(Integer.MAX_VALUE);
+            throw t;
+        }
+        assert !(input instanceof InputStream) || ((InputStream) input).available() == 0;
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+        lifecycleListener.channelActive(ctx);
     }
 
     @Override
@@ -56,5 +58,17 @@ public class ReceiverHandler extends ChannelInboundHandlerAdapter {
         nettyReceiverListener.onError(cause);
     }
 
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+        IpAddress ipAddress = ctx.channel().attr(NettyConnection.ADDRESS_ATTRIBUTE).get();
+        Attribute<Boolean> prevWriteStatus = ctx.channel().attr(NettyConnection.ADDRESS_WRITE_STATUS);
+        boolean isWriteable = ctx.channel().isWritable();
+        if (ipAddress != null && prevWriteStatus != null) {
+            if (prevWriteStatus.get() != isWriteable) {
+                prevWriteStatus.set(isWriteable);
+                nettyReceiverListener.channelWritabilityChanged(ipAddress, isWriteable);
+            }
+        }
+    }
 }
 
