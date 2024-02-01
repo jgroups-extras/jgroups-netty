@@ -4,7 +4,7 @@
     <artifactId>jgroups-netty</artifactId>
     <packaging>jar</packaging>
     <name>jgroups-netty</name>
-    <version>1.0.1.Final-SNAPSHOT</version>
+    <version>1.0.0.Beta2-SNAPSHOT</version>
     <description>A netty based transport layer for JGroups</description>
     <url>http://www.github.com/jgroups-extras/jgroups-netty</url>
 
