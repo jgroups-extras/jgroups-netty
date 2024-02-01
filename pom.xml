@@ -4,7 +4,7 @@
     <artifactId>jgroups-netty</artifactId>
     <packaging>jar</packaging>
     <name>jgroups-netty</name>
-    <version>1.0.0.Final</version>
+    <version>1.0.1.Final-SNAPSHOT</version>
     <description>A netty based transport layer for JGroups</description>
     <url>http://www.github.com/jgroups-extras/jgroups-netty</url>
 
@@ -27,7 +27,7 @@
         <connection>scm:git:git://github.com/jgroups-extras/jgroups-netty.git</connection>
         <developerConnection>scm:git:ssh://git@github.com/jgroups-extras/jgroups-netty.git</developerConnection>
         <url>https://github.com/jgroups-extras/jgroups-netty</url>
-        <tag>jgroups-netty-1.0.0.Final</tag>
+        <tag>HEAD</tag>
     </scm>
 
     <properties>
